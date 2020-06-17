@@ -25,6 +25,7 @@ use Symfony\Component\Console\Input\InputInterface;
 use Symfony\Component\Console\Logger\ConsoleLogger;
 use Symfony\Component\Console\Output\OutputInterface;
 use Symfony\Component\Console\Question\ConfirmationQuestion;
+use Symfony\Component\Filesystem\Filesystem;
 use Symfony\Component\Yaml\Parser;
 use Twig\Environment;
 use Twig\Extension\DebugExtension;
@@ -78,6 +79,8 @@ final class GenerateTypesCommand extends Command
         $outputDir = $input->getArgument('output');
         $configArgument = $input->getArgument('config');
 
+        $filesystem = new Filesystem();
+
         if ($dir = realpath($input->getArgument('output'))) {
             if (!is_dir($dir)) {
                 if (!$this->defaultOutput) {
@@ -93,14 +96,13 @@ final class GenerateTypesCommand extends Command
             }
 
             $outputDir = $dir;
-        } elseif (!@mkdir($outputDir, 0777, true)) {
-            throw new \InvalidArgumentException(sprintf('Cannot create the "%s" directory. Check that the parent directory is writable.', $outputDir));
         } else {
+            $filesystem->mkdir($outputDir);
             $outputDir = realpath($outputDir);
         }
 
         if ($configArgument) {
-            if (!file_exists($configArgument)) {
+            if (!$filesystem->exists($configArgument)) {
                 throw new \InvalidArgumentException(sprintf('The file "%s" doesn\'t exist.', $configArgument));
             }
 
