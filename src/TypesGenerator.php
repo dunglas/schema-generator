@@ -18,6 +18,8 @@ use Doctrine\Common\Collections\ArrayCollection;
 use Doctrine\Common\Collections\Collection;
 use Doctrine\Inflector\Inflector;
 use MyCLabs\Enum\Enum;
+use Nette\PhpGenerator\ClassType;
+use Nette\PhpGenerator\PhpNamespace;
 use PhpCsFixer\Cache\NullCacheManager;
 use PhpCsFixer\Differ\NullDiffer;
 use PhpCsFixer\Error\ErrorsManager;
@@ -130,72 +132,81 @@ class TypesGenerator
             }
         }
 
+        $namespaces = [];
         $classes = [];
+        $interfaces = [];
+
         $propertiesMap = $this->createPropertiesMap($typesToGenerate);
 
         foreach ($typesToGenerate as $typeName => $type) {
             $typeName = \is_string($typeName) ? $typeName : $type->localName();
             $typeConfig = $config['types'][$typeName] ?? null;
-            $class = $baseClass;
 
+            $classMetadata = [];
+            $classMetadata['isEnum'] = $this->isEnum($type);
+
+            $class = new ClassType($typeName);
             $comment = $type->get('rdfs:comment');
 
-            $class['name'] = $typeName;
-            $class['label'] = $comment ? $comment->getValue() : '';
-            $class['resource'] = $type;
-            $class['config'] = $typeConfig;
+            $classMetadata['label'] = $comment ? $comment->getValue() : '';
+            $classMetadata['resource'] = $type;
+            $classMetadata['config'] = $typeConfig;
 
-            $class['isEnum'] = $this->isEnum($type);
-            if ($class['isEnum']) {
-                $class['namespace'] = $typeConfig['namespace'] ?? $config['namespaces']['enum'];
-                $class['parent'] = 'Enum';
-                $class['uses'][] = Enum::class;
+            if ($classMetadata['isEnum']) {
+                $class->setExtends(Enum::class);
+
+                $namespaceName = $typeConfig['namespace'] ?? $config['namespaces']['enum'];
+                if (!isset($namespaces[$namespaceName])) {
+                    $namespaces[$namespaceName] = new PhpNamespace($namespaceName);
+                }
+                $namespaces[$namespaceName]->add($class);
 
                 // Constants
                 foreach ($this->graphs as $graph) {
                     foreach ($graph->allOfType($type->getUri()) as $instance) {
-                        $class['constants'][$instance->localName()] = [
-                            'name' => strtoupper(substr(preg_replace('/([A-Z])/', '_$1', $instance->localName()), 1)),
-                            'resource' => $instance,
-                            'value' => $instance->getUri(),
-                        ];
+                        $class
+                            ->addConstant(strtoupper(substr(preg_replace('/([A-Z])/', '_$1', $instance->localName()), 1)), $instance->getUri())
+                            // TODO: add annotations
+                        ;
                     }
                 }
             } else {
                 // Entities
-                $class['namespace'] = $typeConfig['namespaces']['class'] ?? $config['namespaces']['entity'];
+                $namespaceName = $typeConfig['namespaces']['class'] ?? $config['namespaces']['entity'];
+                if (!isset($namespaces[$namespaceName])) {
+                    $namespaces[$namespaceName] = new PhpNamespace($namespaceName);
+                }
+                $namespaces[$namespaceName]->add($class);
 
-                // Parent
-                $class['parent'] = $typeConfig['parent'] ?? null;
-                if (null === $class['parent']) {
-                    $numberOfSupertypes = \count($type->all('rdfs:subClassOf'));
-
+                $parent = $typeConfig['parent'] ?? null;
+                if (!$parent && $numberOfSupertypes = \count($type->all('rdfs:subClassOf'))) {
                     if ($numberOfSupertypes > 1) {
                         $this->logger->warning(sprintf('The type "%s" has several supertypes. Using the first one.', $type->localName()));
                     }
 
-                    $class['parent'] = $numberOfSupertypes ? $type->all('rdfs:subClassOf')[0]->localName() : false;
-                }
-
-                if (isset($class['parent']) && isset($config['types'][$class['parent']]['namespaces']['class'])) {
-                    $parentNamespace = $config['types'][$class['parent']]['namespaces']['class'];
-
-                    if ($parentNamespace !== $class['namespace']) {
-                        $class['uses'][] = $parentNamespace.'\\'.$class['parent'];
-                    }
+                    $parent = $type->all('rdfs:subClassOf')[0]->localName();
+                    $class->setExtends(sprintf('%s\\%s', $config['types'][$parent]['namespaces']['class'] ?? '', $parent));
                 }
 
                 // Embeddable
-                $class['embeddable'] = $typeConfig['embeddable'] ?? false;
+                $classMetadata['embeddable'] = $typeConfig['embeddable'] ?? false;
 
-                if (!$config['types'] && $class['parent'] && !isset($config['types'][$class['parent']])) {
+                if ($config['types'] && $parent && !isset($config['types'][$parent])) {
                     $this->logger->error(sprintf('The type "%s" (parent of "%s") doesn\'t exist', $class['parent'], $type->localName()));
                 }
 
                 // Interfaces
                 if ($config['useInterface']) {
-                    $class['interfaceNamespace'] = isset($typeConfig['namespaces']['interface']) && $typeConfig['namespaces']['interface'] ? $typeConfig['namespaces']['interface'] : $config['namespaces']['interface'];
-                    $class['interfaceName'] = sprintf('%sInterface', $typeName);
+                    $namespaceName = $typeConfig['namespaces']['interface'] ?? $config['namespaces']['interface'];
+                    if (!isset($namespaces[$namespaceName])) {
+                        $namespaces[$namespaceName] = new PhpNamespace($namespaceName);
+                    }
+
+                    $interface = new ClassType(sprintf('%sInterface', $typeName));
+                    $interface->setInterface();
+                    $namespaces[$namespaceName]->add($interface);
+
+                    $class->setImplements(sprintf('%s\\%s', $namespaceName, $interface->getName()));
                 }
             }
 
@@ -207,13 +218,13 @@ class TypesGenerator
                             continue;
                         }
 
-                        $class = $this->generateField($config, $class, $type, $typeName, $property->localName(), $property);
+                        $class = $this->addProperty($config, $class, $type, $typeName, $property->localName(), $property);
                         continue 2;
                     }
 
                     // Add custom fields (non schema.org)
                     $this->logger->info(sprintf('The property "%s" (type "%s") is a custom property.', $key, $type->localName()));
-                    $class = $this->generateField($config, $class, $type, $typeName, $key);
+                    $class = $this->addProperty($config, $class, $type, $typeName, $key);
                 }
             } else {
                 // All properties
@@ -222,7 +233,7 @@ class TypesGenerator
                         $supersededBy = $property->get('schema:supersededBy');
                         $this->logger->warning(sprintf('The property "%s" is superseded by "%s". Using the superseding property.', $property->localName(), $supersededBy->localName()));
                     } else {
-                        $class = $this->generateField($config, $class, $type, $typeName, $property->localName(), $property);
+                        $class = $this->addProperty($config, $class, $type, $typeName, $property->localName(), $property);
                     }
                 }
             }
@@ -546,55 +557,50 @@ class TypesGenerator
     }
 
     /**
-     * Updates generated $class with given field config.
-     *
-     * @param string $typeName
-     * @param string $propertyName
-     *
-     * @return array $class
+     * Updates generated $class with given property config.
      */
-    private function generateField(array $config, array $class, \EasyRdf_Resource $type, $typeName, $propertyName, \EasyRdf_Resource $property = null): array
+    private function addProperty(array $config, ClassType $class, \EasyRdf_Resource $type, string $typeName, string $propertyName, ?\EasyRdf_Resource $property = null): void
     {
         $typeConfig = $config['types'][$typeName] ?? null;
-        $typesDefined = !empty($config['types']);
+        $typeDefined = !empty($config['types']);
 
         // Warn when property are not part of GoodRelations
-        if ($config['checkIsGoodRelations']) {
-            if (!$this->goodRelationsBridge->exist($propertyName)) {
-                $this->logger->warning(sprintf('The property "%s" (type "%s") is not part of GoodRelations.', $propertyName, $type->localName()));
-            }
+        if ($config['checkIsGoodRelations'] && !$this->goodRelationsBridge->exist($propertyName)) {
+            $this->logger->warning(sprintf('The property "%s" (type "%s") is not part of GoodRelations.', $propertyName, $type->localName()));
         }
 
         // Ignore or warn when properties are legacy
-        if (!empty($property) && preg_match('/legacy spelling/', (string) $property->get('rdfs:comment'))) {
-            if (isset($typeConfig['properties'])) {
-                $this->logger->warning(sprintf('The property "%s" (type "%s") is legacy.', $propertyName, $type->localName()));
-            } else {
-                $this->logger->info(sprintf('The property "%s" (type "%s") is legacy. Ignoring.', $propertyName, $type->localName()));
+        if ($property && preg_match('/legacy spelling/', (string) $property->get('rdfs:comment'))) {
+            if (!isset($typeConfig['properties'])) {
+                $this->logger->debug(sprintf('The property "%s" (type "%s") is legacy. Ignoring.', $propertyName, $type->localName()));
 
-                return $class;
+                return;
             }
+
+            $this->logger->warning(sprintf('The property "%s" (type "%s") is legacy.', $propertyName, $type->localName()));
         }
 
         $propertyConfig = $typeConfig['properties'][$propertyName] ?? null;
 
         $ranges = [];
-        if (isset($propertyConfig['range']) && $propertyConfig['range']) {
+        if ($propertyConfig['range'] ?? false) {
             $ranges[] = $propertyConfig['range'];
-        } elseif (!empty($property)) {
+        } elseif ($property) {
             foreach ($property->all(self::SCHEMA_ORG_RANGE) as $range) {
-                if (!$typesDefined || $this->isDatatype($range->localName()) || isset($config['types'][$range->localName()])) {
-                    $ranges[] = $range->localName();
+                $localName = $range->localName();
+                if (!$typeDefined || isset($config['types'][$localName]) || $this->isDatatype($localName)) {
+                    $ranges[] = $localName;
                 }
             }
         }
 
+        $localName = $type->localName();
         $numberOfRanges = \count($ranges);
         if (0 === $numberOfRanges) {
-            $this->logger->error(sprintf('The property "%s" (type "%s") has an unknown type. Add its type to the config file.', $propertyName, $type->localName()));
+            $this->logger->error(sprintf('The property "%s" (type "%s") has an unknown type. Add its type to the config file.', $propertyName, $localName));
         } else {
             if ($numberOfRanges > 1) {
-                $this->logger->warning(sprintf('The property "%s" (type "%s") has several types. Using the first one ("%s") or possible options("%s").', $propertyName, $type->localName(), reset($ranges), implode('", "', $ranges)));
+                $this->logger->warning(sprintf('The property "%s" (type "%s") has several types. Using the first one ("%s") or possible options("%s").', $propertyName, $localName, reset($ranges), implode('", "', $ranges)));
             }
 
             $cardinality = $propertyConfig['cardinality'] ?? false;
@@ -608,14 +614,10 @@ class TypesGenerator
                 CardinalitiesExtractor::CARDINALITY_N_N,
             ], true);
 
-            if (isset($propertyConfig['nullable'])) {
-                $isNullable = (bool) $propertyConfig['nullable'];
-            } else {
-                $isNullable = !\in_array($cardinality, [
+            $isNullable = (bool) ($propertyConfig['nullable'] ?? !\in_array($cardinality, [
                     CardinalitiesExtractor::CARDINALITY_1_1,
                     CardinalitiesExtractor::CARDINALITY_1_N,
-                ], true);
-            }
+                ], true));
 
             $columnPrefix = false;
             $isEmbedded = $propertyConfig['embedded'] ?? false;
@@ -624,8 +626,10 @@ class TypesGenerator
                 $columnPrefix = $propertyConfig['columnPrefix'] ?? false;
             }
 
+            $class->addProperty($this->getPropertyName($propertyName, $isArray));
+
             $class['fields'][$propertyName] = [
-                'name' => $this->getFieldName($propertyName, $isArray),
+                'name' => ,
                 'resource' => $property,
                 'range' => $ranges[0],
                 'cardinality' => $cardinality,
@@ -652,8 +656,6 @@ class TypesGenerator
                 }
             }
         }
-
-        return $class;
     }
 
     /**
@@ -848,7 +850,7 @@ class TypesGenerator
         $runner->fix();
     }
 
-    private function getFieldName(string $propertyName, bool $isArray): string
+    private function getPropertyName(string $propertyName, bool $isArray): string
     {
         $snakeProperty = preg_replace('/([A-Z])/', '_$1', $propertyName);
         $exploded = explode('_', $snakeProperty);
